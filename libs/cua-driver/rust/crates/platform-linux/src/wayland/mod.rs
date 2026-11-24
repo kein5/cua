@@ -2081,6 +2081,56 @@ fn no_input_activation(window_id: u64) -> anyhow::Error {
     )
 }
 
+/// The libei half of pointer input aimed at `window_id`: wait until the libei
+/// device is `ready`, activate the window, then `send`. The wait comes first
+/// because the portal's consent dialog can take the focus. KWin offers neither
+/// activation route [`activate_window_for_input_target`] knows (the wlroots
+/// foreign-toplevel one and the GNOME helper), so it refuses every window
+/// there. On KWin that refusal comes before the wait, so a call that cannot be
+/// delivered never asks the user to allow remote control. A KWin handle never
+/// gets here: [`refuse_kwin_input`] refused it already.
+fn libei_window_input<T>(
+    window_id: u64,
+    ready: impl FnOnce() -> anyhow::Result<()>,
+    send: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    activated_libei_input(
+        compositor_is_kwin(),
+        window_id,
+        ready,
+        || activate_window_for_input(window_id),
+        send,
+    )
+}
+
+/// [`libei_window_input`] on a compositor known to be (or not be) KWin.
+fn activated_libei_input<T>(
+    on_kwin: bool,
+    window_id: u64,
+    ready: impl FnOnce() -> anyhow::Result<()>,
+    activate: impl FnOnce() -> anyhow::Result<()>,
+    send: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    if on_kwin {
+        return Err(no_input_activation(window_id));
+    }
+    ready()?;
+    activate()?;
+    send()
+}
+
+/// Whether the session's compositor announces KWin's globals. Asked only where
+/// the desktop name may be KDE, so other desktops pay nothing for it. A
+/// compositor that cannot be asked counts as another one, whose activation is
+/// then tried as before.
+fn compositor_is_kwin() -> bool {
+    kwin_capture::may_be_session()
+        && matches!(
+            logical_layout::announced_compositor(),
+            Ok(Some(logical_layout::Compositor::KWin))
+        )
+}
+
 /// Bring one exact window forward for its own sake: `bring_to_front`, and a menu
 /// path fired through AT-SPI. No global input follows, so KWin's activation is
 /// safe here where [`activate_window_for_input_target`] refuses it.
@@ -2229,9 +2279,9 @@ pub fn click(window_id: u64, at: AimedPoint, count: u32, button: u8) -> anyhow::
     with_libei_fallback(
         || click_vptr(Some(window_id), at, count, button, None),
         || {
-            libei_wait_pointer_ready()?;
-            activate_window_for_input(window_id)?;
-            libei_click(at.point.0, at.point.1, count, button)
+            libei_window_input(window_id, libei_wait_pointer_ready, || {
+                libei_click(at.point.0, at.point.1, count, button)
+            })
         },
     )
 }
@@ -2587,12 +2637,12 @@ pub fn scroll_at(
     with_libei_fallback(
         || scroll_vptr(Some(window_id), point, &direction, amount, None),
         || {
-            libei_wait_scroll_ready()?;
-            activate_window_for_input(window_id)?;
-            if let Some(AimedPoint { point: (x, y), .. }) = point {
-                libei_move_absolute(x, y)?;
-            }
-            libei_scroll(&direction, amount)
+            libei_window_input(window_id, libei_wait_scroll_ready, || {
+                if let Some(AimedPoint { point: (x, y), .. }) = point {
+                    libei_move_absolute(x, y)?;
+                }
+                libei_scroll(&direction, amount)
+            })
         },
     )
 }
@@ -2771,9 +2821,9 @@ pub fn drag(
     with_libei_fallback(
         || drag_vptr(Some(window_id), from, to, steps, button, None),
         || {
-            libei_wait_pointer_ready()?;
-            activate_window_for_input(window_id)?;
-            libei_drag(from_x, from_y, to_x, to_y, steps, duration_ms, button)
+            libei_window_input(window_id, libei_wait_pointer_ready, || {
+                libei_drag(from_x, from_y, to_x, to_y, steps, duration_ms, button)
+            })
         },
     )
 }
@@ -4758,6 +4808,45 @@ mod tests {
                 super::NO_VPTR_MARKER
             )
         );
+    }
+
+    /// KWin has no window activation for input, so pointer input aimed at a
+    /// window is refused before the portal could show its consent dialog.
+    #[test]
+    fn kwin_refuses_window_pointer_input_before_asking_the_portal() {
+        let refused: anyhow::Result<()> = super::activated_libei_input(
+            true,
+            42,
+            || panic!("the portal must not be asked on KWin"),
+            || panic!("KWin has no activation to try"),
+            || panic!("nothing may be sent"),
+        );
+        assert_eq!(
+            refused.unwrap_err().to_string(),
+            "foreground_unavailable: this Wayland compositor does not expose a verified, \
+             target-addressable activation adapter for window 42; refusing global input \
+             because it could affect the wrong application"
+        );
+    }
+
+    /// Elsewhere the wait stays first: a consent dialog can take the focus, so
+    /// the window is activated after it.
+    #[test]
+    fn other_compositors_activate_the_window_after_the_portal_wait() {
+        let steps = std::cell::RefCell::new(Vec::new());
+        let step = |name| {
+            steps.borrow_mut().push(name);
+            anyhow::Ok(())
+        };
+        super::activated_libei_input(
+            false,
+            42,
+            || step("ready"),
+            || step("activate"),
+            || step("send"),
+        )
+        .unwrap();
+        assert_eq!(*steps.borrow(), ["ready", "activate", "send"]);
     }
 
     #[test]

@@ -79,6 +79,22 @@ impl Announced {
     }
 }
 
+/// Only the globals' names: [`announced_compositor`] binds nothing.
+impl Dispatch<wl_registry::WlRegistry, ()> for Announced {
+    fn event(
+        state: &mut Self,
+        _: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_registry::Event::Global { interface, .. } = event {
+            state.note(&interface);
+        }
+    }
+}
+
 /// What the compositor reported: which globals it announced, and its outputs.
 #[derive(Debug, Default)]
 struct Report {
@@ -412,6 +428,22 @@ const UNASKED: &str =
 fn query() -> anyhow::Result<Option<(Compositor, Vec<OutputRect>)>> {
     let connection = Connection::connect_to_env().context(UNASKED)?;
     query_on(&connection)
+}
+
+/// Whether the session's compositor is KWin or GNOME Mutter, read from the
+/// globals it announces alone: nothing is bound and no layout is read.
+/// `Ok(None)` when it answered and is neither.
+pub(crate) fn announced_compositor() -> anyhow::Result<Option<Compositor>> {
+    let connection = Connection::connect_to_env().context(UNASKED)?;
+    announced_on(&connection)
+}
+
+fn announced_on(connection: &Connection) -> anyhow::Result<Option<Compositor>> {
+    let mut queue = connection.new_event_queue::<Announced>();
+    connection.display().get_registry(&queue.handle(), ());
+    let mut announced = Announced::default();
+    queue.roundtrip(&mut announced).context(UNASKED)?;
+    Ok(announced.compositor())
 }
 
 fn query_on(connection: &Connection) -> anyhow::Result<Option<(Compositor, Vec<OutputRect>)>> {
@@ -899,6 +931,55 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(error.to_string(), "KWin's output layout could not be read");
+    }
+
+    fn announced_script(script: Script) -> anyhow::Result<Option<Compositor>> {
+        let (client, server) = UnixStream::pair().unwrap();
+        let compositor = std::thread::spawn(move || serve(server, script));
+        let connection = Connection::from_backend(Backend::connect(client).unwrap());
+        let result = announced_on(&connection);
+        drop(connection);
+        compositor.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn the_globals_alone_name_kwin_or_mutter() {
+        let announced = |globals: Vec<&'static str>| {
+            announced_script(Script {
+                globals,
+                ..Script::default()
+            })
+            .unwrap()
+        };
+        // KWin 6.3.6, and 6.8.2 with its renamed output global.
+        assert_eq!(announced(KWIN_GLOBALS.to_vec()), Some(Compositor::KWin));
+        assert_eq!(
+            announced(vec!["wl_output", "kde_output_device_registry_v2"]),
+            Some(Compositor::KWin)
+        );
+        assert_eq!(announced(MUTTER_GLOBALS.to_vec()), Some(Compositor::Mutter));
+        // Sway: the wlroots pointer and toplevel protocols, no KWin global.
+        assert_eq!(
+            announced(vec![
+                "wl_output",
+                "zxdg_output_manager_v1",
+                "zwlr_virtual_pointer_manager_v1",
+                "zwlr_foreign_toplevel_manager_v1",
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_compositor_lost_before_its_globals_is_not_named() {
+        let error = announced_script(Script {
+            globals: KWIN_GLOBALS.to_vec(),
+            hang_up_at_sync: Some(1),
+            ..Script::default()
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), UNASKED);
     }
 
     #[test]

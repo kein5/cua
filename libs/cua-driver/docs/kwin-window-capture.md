@@ -25,8 +25,11 @@ portal/libei path is focus-bound, not window-bound. Activating a UUID and readin
 back focus would leave a race between that check and input delivery. A
 compositor-side target-bound input API is required before these requests can be
 enabled. Installing the read-only Cua KWin helper or restarting AT-SPI does not
-supply that capability. Only `bring_to_front` checks the window's current PID, and
-it returns `foreground_unavailable` when another process owns the window.
+supply that capability. The refusal comes before the driver asks the desktop
+portal for input access, whether or not this adapter is on, so a refused call
+never opens the remote-control consent dialog. Only `bring_to_front` checks the
+window's current PID, and it returns `foreground_unavailable` when another
+process owns the window.
 
 ## Turning it on and off
 
